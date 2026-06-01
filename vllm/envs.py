@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+    VLLM_ROCM_USE_V4_TRITON_FALLBACK: bool = True
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1186,6 +1187,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    ),
+    # Master switch for the ROCm-native code paths used by DeepSeek-V4
+    # (DSv4-Flash-FP8). When True (default on ROCm) the model selects the
+    # triton/torch fallbacks for the sparse indexer and MLA sparse backend
+    # instead of the upstream AITER + native paths. Set to "0" to opt back into
+    # the upstream AITER paths for bisection.
+    "VLLM_ROCM_USE_V4_TRITON_FALLBACK": lambda: (
+        os.getenv("VLLM_ROCM_USE_V4_TRITON_FALLBACK", "True").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE

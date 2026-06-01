@@ -18,6 +18,51 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
 
+# Map ``quantization_config.quant_method`` values that may be observed in the
+# wild to the DeepSeek V4 expert layout they imply. Used as a secondary signal
+# when ``hf_config.expert_dtype`` is missing (some FP8 checkpoints, including
+# DeepSeek-V4-Flash-Base-FP8, ship without it).
+_QUANT_METHOD_TO_EXPERT_DTYPE = {
+    "fp8": "fp8",
+    "deepseek_v4_fp8": "fp8",
+    "mxfp4": "fp4",
+    "fp4": "fp4",
+    "nvfp4": "fp4",
+}
+
+
+def _resolve_deepseek_v4_expert_dtype(hf_config) -> str:
+    """Return the DeepSeek V4 expert layout, inferring it when needed.
+
+    Resolution order:
+
+      1. Honor ``hf_config.expert_dtype`` if present (authoritative).
+      2. Otherwise, peek at ``hf_config.quantization_config.quant_method``
+         and map it via ``_QUANT_METHOD_TO_EXPERT_DTYPE`` so an FP8
+         checkpoint without an explicit ``expert_dtype`` field still
+         picks the FP8 expert dispatch instead of falling through to the
+         MXFP4 path.
+      3. Fall back to ``"fp4"`` (matches upstream's historical default
+         for legacy DSv4 checkpoints).
+    """
+    explicit = getattr(hf_config, "expert_dtype", None)
+    if explicit is not None:
+        return explicit
+
+    qcfg = getattr(hf_config, "quantization_config", None)
+    if qcfg is not None:
+        if isinstance(qcfg, dict):
+            quant_method = qcfg.get("quant_method")
+        else:
+            quant_method = getattr(qcfg, "quant_method", None)
+        if quant_method is not None:
+            inferred = _QUANT_METHOD_TO_EXPERT_DTYPE.get(quant_method)
+            if inferred is not None:
+                return inferred
+
+    return "fp4"
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
@@ -61,7 +106,7 @@ class DeepseekV4FP8Config(Fp8Config):
                 # vllm_config not yet set; defer the decision until a
                 # later call lands inside set_current_vllm_config.
                 return "fp4"
-            expert_dtype = getattr(hf_config, "expert_dtype", "fp4")
+            expert_dtype = _resolve_deepseek_v4_expert_dtype(hf_config)
             if expert_dtype not in _DEEPSEEK_V4_EXPERT_DTYPES:
                 raise ValueError(
                     f"Unsupported DeepSeek V4 expert_dtype={expert_dtype!r}; "

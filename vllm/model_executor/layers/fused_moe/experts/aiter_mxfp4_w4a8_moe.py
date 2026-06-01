@@ -193,12 +193,18 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        # Requires AITER and GFX950
+        # NAVI48-TEST: original gate hard-required GFX950 (MI355) because the
+        # AITER-Triton W4A8 kernels at aiter/ops/triton/moe_op_gemm_a8w4.py
+        # were only validated there. The kernels themselves are pure Triton
+        # and *may* compile and run on gfx12 (Navi48) — bypass the arch gate
+        # to find out empirically. AITER itself is still required (so the
+        # aiter Python package is importable and the relevant ops exist).
+        # TO REVERT: restore the on_gfx950() check below.
         if not rocm_aiter_ops.is_enabled():
             return False
-        from vllm.platforms.rocm import on_gfx950
-
-        return on_gfx950()
+        # from vllm.platforms.rocm import on_gfx950
+        # return on_gfx950()
+        return True
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:

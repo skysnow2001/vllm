@@ -82,7 +82,7 @@ def is_aiter_found_and_supported() -> bool:
     if current_platform.is_rocm() and IS_AITER_FOUND:
         from vllm.platforms.rocm import on_mi3xx
 
-        return on_mi3xx()
+        return True #on_mi3xx()
     return False
 
 

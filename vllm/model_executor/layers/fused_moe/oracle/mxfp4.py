@@ -249,9 +249,18 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         "humming": [Mxfp4MoeBackend.HUMMING],
         "marlin": [Mxfp4MoeBackend.MARLIN],
         "aiter": [
-            Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            # NAVI48-TEST: AITER_MXFP4_BF16 / AITER_MXFP4_MXFP4 use CK kernels
+            # that are gfx950-only (see AiterExperts._supports_quant_scheme,
+            # which hard-rejects when on_gfx950() is False). On gfx12 (Navi48)
+            # they always fail validation, so the oracle would never advance
+            # to AITER_MXFP4_FP8. Skip them temporarily to land on the
+            # AITER-Triton W4A8 path (AiterW4A8ExpertsMonolithic →
+            # aiter/ops/triton/{moe_routing/routing.py, moe_op_gemm_a8w4.py})
+            # which is pure-Triton and doesn't depend on CK assembly.
+            # TO REVERT: uncomment the two CK entries below.
+            # Mxfp4MoeBackend.AITER_MXFP4_BF16,
             Mxfp4MoeBackend.AITER_MXFP4_FP8,
-            Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+            # Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
         ],
         "aiter_mxfp4_fp8": [Mxfp4MoeBackend.AITER_MXFP4_FP8],
         "aiter_mxfp4_mxfp4": [Mxfp4MoeBackend.AITER_MXFP4_MXFP4],

@@ -6,9 +6,17 @@ import torch
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
-HAS_TILELANG = has_tilelang()
+# TileLang's MHC kernels have no ROCm/HIP codegen backend: even when the
+# `tilelang` python package imports cleanly, building any kernel on ROCm raises
+# "Cannot find global function target.build.tilelang_hip". (And on some images
+# the import itself dies on a missing libz3.so transitive dep.) Gate the
+# platform check *first* so on ROCm we (a) never call has_tilelang() — avoiding
+# the libz3 import crash — and (b) take the built-in torch/triton fallbacks
+# (mhc_pre_torch / mhc_post_torch / hc_head_triton) instead of tilelang.
+HAS_TILELANG = (not current_platform.is_rocm()) and has_tilelang()
 
 
 # --8<-- [start:mhc_pre]
@@ -373,11 +381,38 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.mhc_fused_post_pre_tilelang(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
+        if HAS_TILELANG:
+            return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+        # ROCm fallback: tilelang has no HIP codegen (and the fused kernel uses
+        # Hopper-only PDL). Compose the existing torch fallbacks of mhc_post +
+        # mhc_pre — both have a ROCm path and produce the exact output
+        # shapes/dtypes the fused op contracts on.
+        if post_layer_mix.ndim == residual.ndim - 1:
+            post_layer_mix_3d = post_layer_mix.unsqueeze(-1)
+        else:
+            post_layer_mix_3d = post_layer_mix
+        residual_cur = mhc_kernels.mhc_post_torch(
+            x, residual, post_layer_mix_3d, comb_res_mix
+        )
+        post_mix_cur, comb_mix_cur, layer_input_cur = mhc_kernels.mhc_pre_torch(
+            residual_cur,
             fn,
             hc_scale,
             hc_base,
@@ -386,11 +421,8 @@ class MHCFusedPostPreOp(CustomOp):
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
-            n_splits,
-            tile_n,
-            norm_weight,
-            norm_eps,
         )
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
     def forward_native(self, *args, **kwargs):
         raise NotImplementedError(

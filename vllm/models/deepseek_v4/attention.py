@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+    quantize_and_insert_k_cache,
 )
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
@@ -97,7 +98,13 @@ def _select_v4_sparse_impl(
 
         logger.info_once("Using FLASHINFER_MLA_SPARSE_DSV4 backend.")
         return DeepseekV4FlashInferMLASparseImpl
-    if current_platform.is_rocm():
+    if current_platform.is_rocm() and not envs.VLLM_ROCM_USE_V4_TRITON_FALLBACK:
+        # Default on ROCm (env unset/False): the fused Triton sparse MLA
+        # backend (rocm_aiter_mla_sparse, PR #41812). The torch online-softmax
+        # FlashMLA path below is reachable only as a backup by setting
+        # VLLM_ROCM_USE_V4_TRITON_FALLBACK=1 (e.g. for bisection); its kernels
+        # are supplied by ``vllm.v1.attention.ops.flashmla`` →
+        # ``flash_mla_with_kvcache_rocm`` / ``flash_mla_sparse_fwd_rocm``.
         from vllm.models.deepseek_v4.amd.rocm import (
             DeepseekV4ROCMAiterMLASparseImpl,
         )
@@ -144,6 +151,102 @@ def _resolve_dsv4_kv_cache_dtype(
         kv_cache_dtype = "fp8_ds_mla"
         logger.info_once("Using DeepSeek's fp8_ds_mla KV cache format.")
     return kv_cache_dtype, torch.uint8
+
+
+def _apply_rope_gptj_last_dims(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_dim: int,
+) -> torch.Tensor:
+    """GPT-J-style (interleaved-pair) RoPE on the last rope_dim elements.
+
+    Numerically matches ``fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`` /
+    tests in ``test_fused_deepseek_v4_qnorm_rope_kv_insert``.
+    """
+    half = rope_dim // 2
+    head_dim = x.shape[-1]
+    nope_dim = head_dim - rope_dim
+
+    cs = cos_sin_cache[positions].to(torch.float32)
+    cos = cs[..., :half]
+    sin = cs[..., half:]
+
+    rope = x[..., nope_dim:].float()
+    shape = rope.shape
+    rope = rope.reshape(*shape[:-1], half, 2)
+    even = rope[..., 0]
+    odd = rope[..., 1]
+
+    for _ in range(rope.ndim - 3):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+    new_even = even * cos - odd * sin
+    new_odd = even * sin + odd * cos
+    rope_rotated = torch.stack((new_even, new_odd), dim=-1).reshape(shape)
+
+    out = x.clone().float()
+    out[..., nope_dim:] = rope_rotated
+    return out.to(x.dtype)
+
+
+def _deepseek_v4_qnorm_rope_kv_insert_reference(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_head_padded: int,
+    eps: float,
+    cache_block_size: int,
+    q_head_norm: nn.Module,
+    rope_dim: int,
+) -> torch.Tensor:
+    """PyTorch/Triton reference for ROCm builds where the fused CUDA op is absent.
+
+    Returns a ``[num_tokens, q_head_padded, head_dim]`` tensor with the q-side
+    normalised + RoPE-rotated values in the leading ``n_local_heads`` slots and
+    zeros in the trailing padding slots (matching the C++ kernel's output
+    contract). As a side effect, writes the RoPE-rotated, UE8M0-quantised KV
+    block into ``k_cache`` at the positions described by ``slot_mapping``.
+    """
+    num_tokens, n_local_heads, head_dim = q.shape
+
+    q_out_inner = _apply_rope_gptj_last_dims(
+        q_head_norm(q.reshape(-1, head_dim)).view_as(q),
+        positions,
+        cos_sin_cache,
+        rope_dim,
+    )
+
+    if q_head_padded == n_local_heads:
+        q_out = q_out_inner
+    else:
+        q_out = torch.zeros(
+            (num_tokens, q_head_padded, head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        q_out[:, :n_local_heads, :] = q_out_inner
+
+    num_tokens_insert = slot_mapping.shape[0]
+    if num_tokens_insert == 0:
+        return q_out
+
+    kv_slice = kv[:num_tokens_insert]
+    pos_slice = positions[:num_tokens_insert]
+    kv_roped = _apply_rope_gptj_last_dims(
+        kv_slice, pos_slice, cos_sin_cache, rope_dim
+    )
+    quantize_and_insert_k_cache(
+        kv_roped,
+        k_cache,
+        slot_mapping,
+        block_size=cache_block_size,
+    )
+    return q_out
 
 
 class DeepseekV4MLA(nn.Module):
@@ -557,7 +660,30 @@ class DeepseekV4MLA(nn.Module):
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            # The fused C++ kernel is registered only for CUDA, and its FP8
+            # dtype is selected at *compile time* via ``HIP_FP8_TYPE_OCP``
+            # whereas MI300X (gfx942) is FNUZ-only at runtime — a mismatch
+            # silently corrupts every K byte written to the SWA cache. Always
+            # use the Python/Triton reference on ROCm (the C++ kernel is
+            # unavailable there); this is decoupled from
+            # VLLM_ROCM_USE_V4_TRITON_FALLBACK so the default Triton
+            # sparse-attention path stays self-consistent.
+            use_torch_ref = current_platform.is_rocm()
+
+            if not use_torch_ref:
+                return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                    q,
+                    kv,
+                    swa_kv_cache_2d,
+                    swa_metadata.slot_mapping,
+                    positions,
+                    cos_sin_cache,
+                    self.padded_heads,
+                    self.eps,
+                    swa_metadata.block_size,
+                )
+
+            return _deepseek_v4_qnorm_rope_kv_insert_reference(
                 q,
                 kv,
                 swa_kv_cache_2d,
@@ -567,6 +693,8 @@ class DeepseekV4MLA(nn.Module):
                 self.padded_heads,
                 self.eps,
                 swa_metadata.block_size,
+                self.q_head_norm,
+                self.rope_head_dim,
             )
 
         # FlashInfer full-cache path: contiguous [num_blocks, block_size, 512]
