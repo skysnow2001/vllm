@@ -467,18 +467,35 @@ def rocm_sparse_attn_indexer_no_insert(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
-        # Slow-but-correct paged compute. Future Triton kernel TODO: walk the
-        # block_table on-device to avoid the per-batch python loop and the
-        # per-block (H, next_n, block_size) intermediate.
-        logits = _mqa_logits_paged_torch(
-            padded_q_fp8_decode_tokens,
-            kv_cache_4d,
-            weights[:num_padded_tokens],
-            decode_metadata.seq_lens,
-            decode_metadata.block_table,
-            max_model_len,
-            head_dim,
-        )
+        if envs.VLLM_DSV4_TRITON:
+            # Triton paged MQA-logits via aiter's non-gluon JIT kernel
+            # (`paged_mqa_logits_module()` forces the gluon dispatch off; on
+            # gfx12 this lands on `deepgemm_fp8_paged_mqa_logits_stage1`). Same
+            # input layout the aiter indexer path uses.
+            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                rocm_fp8_paged_mqa_logits,
+            )
+
+            logits = rocm_fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache_4d,
+                weights[:num_padded_tokens],
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                getattr(decode_metadata, "schedule_metadata", None),
+                max_model_len=max_model_len,
+            )
+        else:
+            # Slow-but-correct paged compute (Python block-table loop).
+            logits = _mqa_logits_paged_torch(
+                padded_q_fp8_decode_tokens,
+                kv_cache_4d,
+                weights[:num_padded_tokens],
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+                head_dim,
+            )
 
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]

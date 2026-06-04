@@ -18,6 +18,13 @@ from vllm.utils.import_utils import has_tilelang
 # (mhc_pre_torch / mhc_post_torch / hc_head_triton) instead of tilelang.
 HAS_TILELANG = (not current_platform.is_rocm()) and has_tilelang()
 
+# On ROCm (e.g. gfx12/Navi48) tilelang has no HIP codegen, so MHC runs through
+# AITER's fused *Triton* kernels (aiter.ops.triton.fusions.mhc) when available.
+# The mhc_*_torch references stay as the backup if the aiter module is missing.
+HAS_AITER_TRITON_MHC = (
+    current_platform.is_rocm() and mhc_kernels.has_aiter_triton_mhc()
+)
+
 
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
@@ -112,7 +119,22 @@ class MHCPreOp(CustomOp):
                 norm_weight,
                 norm_eps,
             )
+        elif HAS_AITER_TRITON_MHC:
+            # ROCm default: AITER fused Triton mHC pre kernel.
+            return torch.ops.vllm.mhc_pre_aiter_triton(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
         else:
+            # Backup: torch reference.
             return self.forward_native(
                 residual,
                 fn,
@@ -206,7 +228,13 @@ class MHCPostOp(CustomOp):
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
             )
+        elif HAS_AITER_TRITON_MHC:
+            # ROCm default: AITER fused Triton mHC post kernel.
+            return torch.ops.vllm.mhc_post_aiter_triton(
+                x, residual, post_layer_mix, comb_res_mix
+            )
         else:
+            # Backup: torch reference.
             return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
 
     def forward_native(
@@ -400,10 +428,30 @@ class MHCFusedPostPreOp(CustomOp):
                 norm_weight,
                 norm_eps,
             )
-        # ROCm fallback: tilelang has no HIP codegen (and the fused kernel uses
-        # Hopper-only PDL). Compose the existing torch fallbacks of mhc_post +
-        # mhc_pre — both have a ROCm path and produce the exact output
-        # shapes/dtypes the fused op contracts on.
+        # ROCm: tilelang has no HIP codegen (and the fused kernel uses
+        # Hopper-only PDL). Default to AITER's fused Triton post+pre kernel.
+        if HAS_AITER_TRITON_MHC:
+            return torch.ops.vllm.mhc_fused_post_pre_aiter_triton(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+
+        # Backup: compose the torch references of mhc_post + mhc_pre — both
+        # produce the exact output shapes/dtypes the fused op contracts on.
         if post_layer_mix.ndim == residual.ndim - 1:
             post_layer_mix_3d = post_layer_mix.unsqueeze(-1)
         else:

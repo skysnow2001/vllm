@@ -130,7 +130,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
-    VLLM_ROCM_USE_V4_TRITON_FALLBACK: bool = True
+    VLLM_ROCM_USE_V4_TRITON_FALLBACK: bool = False
+    VLLM_DSV4_TRITON: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1188,13 +1189,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
     ),
-    # Master switch for the ROCm-native code paths used by DeepSeek-V4
-    # (DSv4-Flash-FP8). When True (default on ROCm) the model selects the
-    # triton/torch fallbacks for the sparse indexer and MLA sparse backend
-    # instead of the upstream AITER + native paths. Set to "0" to opt back into
-    # the upstream AITER paths for bisection.
+    # Backup switch for DeepSeek-V4 (DSv4-Flash-FP8) MLA *sparse attention* on
+    # ROCm. Default False: the model runs the fused Triton sparse MLA backend
+    # (rocm_aiter_mla_sparse, from PR #41812). Set to "1" to fall back to the
+    # torch online-softmax FlashMLA path (rocm_flash_mla_sparse) for bisection.
+    # NOTE: this no longer gates the qnorm-rope-kv-insert reference (always the
+    # Python/Triton ref on ROCm — the C++ kernel is CUDA-only) nor the Triton
+    # sparse indexer (always used on ROCm when AITER is off); both are
+    # decoupled so the default Triton attention path stays self-consistent.
     "VLLM_ROCM_USE_V4_TRITON_FALLBACK": lambda: (
-        os.getenv("VLLM_ROCM_USE_V4_TRITON_FALLBACK", "True").lower() in ("true", "1")
+        os.getenv("VLLM_ROCM_USE_V4_TRITON_FALLBACK", "False").lower()
+        in ("true", "1")
+    ),
+    # DeepSeek-V4 "all-Triton" master switch for ROCm archs without CK/ASM
+    # support (e.g. gfx12/Navi48). When True it forces the Triton variants of
+    # aiter ops over the CK/ASM ones that won't run on such archs:
+    #   * enables aiter Triton linear / blockscale GEMM selection (without
+    #     flipping the global aiter is_enabled(), so the Triton sparse indexer
+    #     and MLA paths stay selected);
+    #   * forces the blockscale GEMM onto its Triton kernel (never CK);
+    #   * keeps the Triton sparse indexer even when aiter is otherwise enabled;
+    #   * routes the DSv4 o-proj grouped GEMM through aiter's Triton batched
+    #     GEMM instead of the torch einsum reference.
+    # MoE already lands on the AITER Triton W4A8 path via the mxfp4 oracle.
+    "VLLM_DSV4_TRITON": lambda: (
+        os.getenv("VLLM_DSV4_TRITON", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE

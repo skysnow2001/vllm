@@ -515,14 +515,15 @@ class SparseAttnIndexer(CustomOp):
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
 
-        # We only take this path when the
-        # compressor has already inserted K (skip_k_cache_insert=True), AITER
-        # is off, and the env-var gate is on (default). Falls through to the
-        # upstream path otherwise.
-        if (
-            self.skip_k_cache_insert
-            and not rocm_aiter_ops.is_enabled()
-            and envs.VLLM_ROCM_USE_V4_TRITON_FALLBACK
+        # Default ROCm path: the compressor has already inserted K
+        # (skip_k_cache_insert=True) and AITER is off, so we run the Triton
+        # MQA-logits sparse indexer. Decoupled from
+        # VLLM_ROCM_USE_V4_TRITON_FALLBACK (which now only toggles the MLA
+        # sparse-attention backup) so the Triton indexer stays the default.
+        # VLLM_DSV4_TRITON forces this Triton path even when aiter is otherwise
+        # enabled (the aiter indexer needs the gfx-gated paged MQA-logits).
+        if self.skip_k_cache_insert and (
+            envs.VLLM_DSV4_TRITON or not rocm_aiter_ops.is_enabled()
         ):
             # Import lazily so non-ROCm builds don't pay the import cost.
             import vllm.v1.attention.ops.rocm_sparse_attn_indexer  # noqa: F401

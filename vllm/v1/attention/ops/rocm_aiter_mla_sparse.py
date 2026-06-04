@@ -8,6 +8,7 @@ from importlib.util import find_spec
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
@@ -368,6 +369,17 @@ def paged_mqa_logits_module():
     if paged_mqa_logits_module_path is not None:
         try:
             module = importlib.import_module(paged_mqa_logits_module_path)
+            # Force the non-gluon JIT path: the gluon kernels target
+            # gfx950/gfx1250 (CDNA intrinsics) and won't compile on gfx12.
+            # Setting these module globals makes the wrapper's
+            # `if enable_gluon_pa_mqa_logits:` branch False so it dispatches to
+            # the plain @triton.jit `_deepgemm_fp8_paged_mqa_logits*` kernels.
+            for _flag in (
+                "enable_gluon_pa_mqa_logits",
+                "enable_jit_gluon_pa_mqa_logits_kernel",
+            ):
+                if hasattr(module, _flag):
+                    setattr(module, _flag, False)
             return module
         except ImportError:
             return None
@@ -411,7 +423,9 @@ def rocm_fp8_paged_mqa_logits(
     batch_size, next_n, heads, head_dim = q_fp8.shape
     num_blocks, block_size, _, _ = kv_cache_fp8.shape
 
-    if rocm_aiter_ops.is_enabled():
+    # VLLM_DSV4_TRITON routes the Triton sparse indexer's decode here even when
+    # the global aiter path is off, so load the module under either condition.
+    if rocm_aiter_ops.is_enabled() or envs.VLLM_DSV4_TRITON:
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
@@ -926,7 +940,53 @@ def rocm_inv_rope_einsum(
             torch.bfloat16
         )
 
+    if envs.VLLM_DSV4_TRITON:
+        out = _rocm_triton_grouped_oproj_gemm(o_ref, wo_a_weight)
+        if out is not None:
+            return out
+
     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+
+
+# Explicit launch config for the o-proj batched GEMM. aiter ships no
+# gfx12 (gfx1201) BATCHED_GEMM-A16W16 tuning json and its loader asserts on a
+# missing file, so we pass a config to take the ``config is not None`` branch.
+_OPROJ_BATCHED_GEMM_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 4,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "kpack": 1,
+}
+
+
+def _rocm_triton_grouped_oproj_gemm(
+    o_ref: torch.Tensor,  # (T, G, hidden_dim) bf16
+    wo_a_weight: torch.Tensor,  # (G, o_lora_rank, hidden_dim) bf16
+) -> torch.Tensor | None:
+    """Triton grouped GEMM for the o-proj ``einsum("tgd,grd->tgr")``.
+
+    Per group g: ``o_ref[:, g, :] @ wo_a_weight[g].T``. Maps to aiter
+    ``batched_gemm_bf16`` (XQ:(B,M,K), WQ:(B,N,K) internally transposed) ->
+    (B,M,N) with B=groups, M=tokens, K=hidden_dim, N=o_lora_rank. Returns None
+    on any failure so the caller can fall back to the torch einsum.
+    """
+    try:
+        from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
+            batched_gemm_bf16,
+        )
+
+        xq = o_ref.transpose(0, 1).contiguous()  # (G, T, hidden_dim)
+        out = batched_gemm_bf16(
+            xq, wo_a_weight, config=_OPROJ_BATCHED_GEMM_CONFIG
+        )  # (G, T, o_lora_rank)
+        return out.transpose(0, 1).contiguous()  # (T, G, o_lora_rank)
+    except Exception:
+        return None
 
 
 _DSV4_SPARSE_NOPE_DIM = 448

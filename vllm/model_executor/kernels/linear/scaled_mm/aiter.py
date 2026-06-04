@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import (
     rocm_aiter_ops,
@@ -277,9 +278,11 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         super().__init__(config)
         n, k = config.weight_shape
 
-        self.use_triton = (
-            not current_platform.is_fp8_fnuz()
-            and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
+        self.use_triton = not current_platform.is_fp8_fnuz() and (
+            # VLLM_DSV4_TRITON forces the Triton kernel unconditionally so an
+            # untuned (n, k) never falls back to the CK kernel (absent on gfx12).
+            envs.VLLM_DSV4_TRITON
+            or rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
         )
 
     @classmethod
