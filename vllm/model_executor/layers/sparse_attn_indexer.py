@@ -517,9 +517,7 @@ class SparseAttnIndexer(CustomOp):
 
         # Default ROCm path: the compressor has already inserted K
         # (skip_k_cache_insert=True) and AITER is off, so we run the Triton
-        # MQA-logits sparse indexer. Decoupled from
-        # VLLM_ROCM_USE_V4_TRITON_FALLBACK (which now only toggles the MLA
-        # sparse-attention backup) so the Triton indexer stays the default.
+        # MQA-logits sparse indexer.
         # VLLM_DSV4_TRITON forces this Triton path even when aiter is otherwise
         # enabled (the aiter indexer needs the gfx-gated paged MQA-logits).
         if self.skip_k_cache_insert and (

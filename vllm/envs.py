@@ -132,7 +132,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
-    VLLM_ROCM_USE_V4_TRITON_FALLBACK: bool = False
     VLLM_DSV4_TRITON: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -1201,18 +1200,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
-    ),
-    # Backup switch for DeepSeek-V4 (DSv4-Flash-FP8) MLA *sparse attention* on
-    # ROCm. Default False: the model runs the fused Triton sparse MLA backend
-    # (rocm_aiter_mla_sparse, from PR #41812). Set to "1" to fall back to the
-    # torch online-softmax FlashMLA path (rocm_flash_mla_sparse) for bisection.
-    # NOTE: this no longer gates the qnorm-rope-kv-insert reference (always the
-    # Python/Triton ref on ROCm — the C++ kernel is CUDA-only) nor the Triton
-    # sparse indexer (always used on ROCm when AITER is off); both are
-    # decoupled so the default Triton attention path stays self-consistent.
-    "VLLM_ROCM_USE_V4_TRITON_FALLBACK": lambda: (
-        os.getenv("VLLM_ROCM_USE_V4_TRITON_FALLBACK", "False").lower()
-        in ("true", "1")
     ),
     # DeepSeek-V4 "all-Triton" master switch for ROCm archs without CK/ASM
     # support (e.g. gfx12/Navi48). When True it forces the Triton variants of

@@ -652,9 +652,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # whereas MI300X (gfx942) is FNUZ-only at runtime — a mismatch
             # silently corrupts every K byte written to the SWA cache. Always
             # use the Python/Triton reference on ROCm (the C++ kernel is
-            # unavailable there); this is decoupled from
-            # VLLM_ROCM_USE_V4_TRITON_FALLBACK so the default Triton
-            # sparse-attention path stays self-consistent.
+            # unavailable there).
             use_torch_ref = current_platform.is_rocm()
 
             if not use_torch_ref:

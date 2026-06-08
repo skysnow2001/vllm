@@ -191,9 +191,7 @@ esac
 export VLLM_ROCM_USE_AITER_RMSNORM="${VLLM_ROCM_USE_AITER_RMSNORM:-0}"
 export VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION="${VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION:-1}"
 # NOTE: the fused Triton sparse MLA backend (rocm_aiter_mla_sparse, PR #41812)
-# is now the ROCm DEFAULT — no env var needed. To fall back to the torch
-# online-softmax FlashMLA path for bisection, set (outside this script):
-#   VLLM_ROCM_USE_V4_TRITON_FALLBACK=1
+# is the only ROCm sparse-MLA path (no env var needed).
 
 # Pick vllm binary: prefer in-repo venv, fall back to PATH.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

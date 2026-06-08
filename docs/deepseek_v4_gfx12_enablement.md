@@ -29,9 +29,9 @@ Also: **rebuilt the vLLM C++/HIP extensions** (`_C`, `_rocm_C`, `_moe_C`,
 - **New `VLLM_DSV4_TRITON`** (`vllm/envs.py`): master "all-Triton on gfx12"
   switch — forces aiter-Triton linear/blockscale + o-proj, keeps the Triton
   sparse indexer, decouples qnorm from the CK path.
-- **Flipped `VLLM_ROCM_USE_V4_TRITON_FALLBACK` default → False**
-  (`vllm/envs.py`): Triton sparse-MLA is now the ROCm default; the torch
-  online-softmax path is opt-in backup.
+- The fused Triton sparse-MLA backend (`rocm_aiter_mla_sparse`, upstreamed via
+  main) is the only ROCm sparse-MLA path; the qnorm-rope-kv-insert always uses
+  the Python/Triton reference on ROCm (the C++ kernel is CUDA-only).
 
 ## 3. Triton kernel wiring (code)
 - **Sparse-MLA attention** is the default ROCm impl
@@ -96,7 +96,7 @@ Result: decode TPOT 186 ms (piecewise) → **48 ms** (full), ~3.9×.
 | Category | Tweaks |
 |---|---|
 | Deps/build | torch 2.12, torchvision 0.27, compressed-tensors 0.17, kernels 0.12.3, rebuild `_C*` |
-| Env | new `VLLM_DSV4_TRITON`; flip `VLLM_ROCM_USE_V4_TRITON_FALLBACK` default |
+| Env | new `VLLM_DSV4_TRITON` master switch |
 | Triton wiring | sparse-MLA default, aiter linear/blockscale, o-proj GEMM, MHC, indexer (gluon-off), MoE `triton_unfused` |
 | FULL cudagraph | hc_scale host-sync cache; conditional `cudagraph_unsafe` tag |
 | 3rd-party | OAI `triton_kernels` install + top-k=6 pow2 patch |
