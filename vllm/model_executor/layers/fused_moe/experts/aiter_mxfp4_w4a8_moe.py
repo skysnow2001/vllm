@@ -48,18 +48,6 @@ def aiter_triton_kernel_w4a8_moe_forward(
     )
     from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
 
-    # Map the gated-SwiGLU variant to the aiter `_swiglu` (alpha, limit) params:
-    #   SILU (DeepSeek-V4): plain SiLU-SwiGLU  -> alpha=1.0,   limit=None
-    #   SWIGLUOAI (gpt-oss): clamped sigmoid    -> alpha=1.702, limit=7.0
-    if activation == MoEActivation.SILU:
-        swiglu_alpha, swiglu_limit = 1.0, None
-    elif activation == MoEActivation.SWIGLUOAI:
-        swiglu_alpha, swiglu_limit = 1.702, 7.0
-    else:
-        raise ValueError(
-            f"aiter W4A8 MoE supports SILU/SWIGLUOAI, got {activation}"
-        )
-
     routing_data, gather_idx, scatter_idx = aiter_routing(
         gating_output, topk, sm_first=not renormalize
     )
@@ -72,8 +60,6 @@ def aiter_triton_kernel_w4a8_moe_forward(
         gather_idx,
         scatter_idx,
         activation=activation.value,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_limit=swiglu_limit,
         quant_config=quant_config,
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=global_num_experts,
@@ -207,18 +193,12 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        # NAVI48-TEST: original gate hard-required GFX950 (MI355) because the
-        # AITER-Triton W4A8 kernels at aiter/ops/triton/moe_op_gemm_a8w4.py
-        # were only validated there. The kernels themselves are pure Triton
-        # and *may* compile and run on gfx12 (Navi48) — bypass the arch gate
-        # to find out empirically. AITER itself is still required (so the
-        # aiter Python package is importable and the relevant ops exist).
-        # TO REVERT: restore the on_gfx950() check below.
+        # Requires AITER and GFX950
         if not rocm_aiter_ops.is_enabled():
             return False
-        # from vllm.platforms.rocm import on_gfx950
-        # return on_gfx950()
-        return True
+        from vllm.platforms.rocm import on_gfx950
+
+        return on_gfx950()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -237,11 +217,8 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        # Both plain SiLU-SwiGLU (DeepSeek-V4) and gpt-oss SWIGLUOAI are
-        # supported: the underlying aiter `_swiglu` kernel computes plain SiLU
-        # at alpha=1.0/limit=None and gpt-oss at alpha=1.702/limit=7.0
-        # (see aiter_triton_kernel_w4a8_moe_forward for the mapping).
-        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        # Only SILU activation (swiglu) is supported
+        return activation == MoEActivation.SWIGLUOAI
 
     @staticmethod
     def _supports_parallel_config(
@@ -301,7 +278,6 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             gating_output=router_logits,
             topk=self.topk,
             renormalize=self.renormalize,
-            activation=activation,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             quant_config=self.quant_config,

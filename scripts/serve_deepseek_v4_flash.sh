@@ -63,65 +63,30 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-PIECEWISE}"
 
 # Which MXFP4 MoE backend to pass to `vllm serve --moe-backend`.
-# Only umbrella names are accepted by the vllm CLI argparser; the per-variant
-# enum entries (AITER_MXFP4_BF16/FP8/MXFP4) are only addressable as a group
-# via "aiter". Dispatch table at
-# vllm/model_executor/layers/fused_moe/oracle/mxfp4.py:
+# Dispatch table at vllm/model_executor/layers/fused_moe/oracle/mxfp4.py.
 #
+#   auto            → no flag passed; vllm's oracle walks its own priority
+#                     list and picks the first supported backend (default).
 #   triton          → Mxfp4MoeBackend.TRITON         → OAITritonMxfp4ExpertsMonolithic
-#                     OpenAI `triton_kernels` (fused matmul). SAME routing
-#                     kernel as triton_unfused → SAME `tl.arange(0, N_EXPTS_ACT
-#                     * BLOCK_M)` pow2 bug for DSv4-Flash (top-k=6). Listed
-#                     here for completeness; expect a crash.
+#                     OpenAI `triton_kernels` fused matmul.
 #   triton_unfused  → Mxfp4MoeBackend.TRITON_UNFUSED → UnfusedOAITritonExperts
-#                     vllm's auto-picked path for DSv4 on ROCm. Same upstream
-#                     `triton_kernels.routing` import → CRASHES on DSv4-Flash.
-#   aiter           → map_mxfp4_backend("aiter") returns the candidate list
-#                     [AITER_MXFP4_BF16, AITER_MXFP4_FP8, AITER_MXFP4_MXFP4]
-#                     and the oracle walks them in order until one's
-#                     is_supported_config() returns True:
-#                       • AITER_MXFP4_BF16  → AiterExperts (rocm_aiter_moe.py)
-#                           CK + MFMA assembly via aiter.fused_moe.fused_moe
-#                           backed by aiter/jit/module_moe_*.so . Tuned for
-#                           MI300/gfx942; on Navi48/gfx12 it'll likely reject
-#                           validation and fall through.
-#                       • AITER_MXFP4_FP8   → AiterW4A8ExpertsMonolithic
-#                           AITER's OWN Triton kernels at
-#                           aiter/ops/triton/{moe_routing/routing.py,
-#                           moe_op_gemm_a8w4.py, quant_moe.py}. Bypasses
-#                           OpenAI's `triton_kernels` entirely, so the pow2
-#                           bug doesn't apply. Tradeoff: W4A8 instead of W4A16
-#                           (activation re-quantization to FP8).
-#                       • AITER_MXFP4_MXFP4 → AiterExperts (CK, W4A4)
-#                           Last-resort fallback, also MI300-tuned.
+#                     OpenAI `triton_kernels` modular path; the DSv4-Flash
+#                     MoE path used on gfx12. Routing goes through the OAI
+#                     `triton_kernels.routing` kernel, which needs the top-k=6
+#                     power-of-2 patch in
+#                     vllm/third_party/triton_kernels/routing_details/_routing_compute.py
+#                     (otherwise `tl.arange(0, N_EXPTS_ACT*BLOCK_M)` asserts).
 #
-# Default is `auto` — let vllm's oracle (FP8 / MXFP4 / etc., per the model's
-# quant config) walk its own priority list and pick the first supported
-# backend. When MOE_BACKEND=auto we DON'T forward --moe-backend to vllm at
-# all (vllm's CLI default is also "auto"); that way the oracle takes the
-# "auto" code path with platform-specific move-to-front rules, instead of
-# the explicit-override branch that short-circuits the priority list.
-#
-# Other accepted values reach vllm's --moe-backend argparser unchanged
-# (which itself enforces a longer whitelist; see `vllm bench serve --help=all`
-# or the oracle's map_*_backend tables). Common picks:
-#
-#   auto            → no flag passed; oracle's priority list runs (default)
-#   triton          → OpenAI triton_kernels (fused matmul, MXFP4 path).
-#                     Same routing kernel as triton_unfused → tl.arange
-#                     pow2 bug for top-k=6 (DSv4-Flash). Fine for top-k=8.
-#   triton_unfused  → vllm's auto-pick for DSv4 on ROCm. Same upstream
-#                     triton_kernels.routing import → crashes on top-k=6.
-#   aiter           → ROCm AITER experts. On non-MI3xx (e.g. gfx12 Navi48)
-#                     the device gate rejects → oracle raises if forced.
-#                     Setting this also forces VLLM_ROCM_USE_AITER{_MOE}=1
-#                     below (otherwise the device gate trips on env, not arch).
+# When MOE_BACKEND=auto we DON'T forward --moe-backend (vllm's CLI default is
+# also "auto"); that way the oracle takes the "auto" code path with
+# platform-specific move-to-front rules instead of the explicit-override
+# branch. Any other value is forwarded to --moe-backend unchanged.
 MOE_BACKEND="${MOE_BACKEND:-auto}"
 case "$MOE_BACKEND" in
-    auto|triton|triton_unfused|aiter) ;;
+    auto|triton|triton_unfused) ;;
     *)
         echo "[serve_deepseek_v4_flash] ERROR: invalid MOE_BACKEND='$MOE_BACKEND'" >&2
-        echo "  must be one of: auto, triton, triton_unfused, aiter" >&2
+        echo "  must be one of: auto, triton, triton_unfused" >&2
         exit 2
         ;;
 esac
@@ -130,18 +95,8 @@ esac
 #
 # VLLM_ROCM_USE_AITER_MOE is FORCED (not defaulted) based on $MOE_BACKEND.
 # We can't use ${VAR:-default} here because that honors an existing VAR=0
-# from the user's shell — and we hit exactly that bug once: a stale
-# `export VLLM_ROCM_USE_AITER_MOE=0` in the interactive shell caused every
-# AITER_MXFP4_{BF16,FP8,MXFP4} variant to fail is_supported_config() and
-# the oracle to raise
-#   ValueError: Mxfp4 MoE backend 'AITER_MXFP4_MXFP4' does not support the
-#   deployment configuration since kernel does not support current device
-#   rocm. AITER MoE is not enabled — set VLLM_ROCM_USE_AITER=1 and
-#   VLLM_ROCM_USE_AITER_MOE=1 to enable it.
-# When MOE_BACKEND=aiter we hard-set both AITER=1 and AITER_MOE=1, warning
-# loudly if we had to override a conflicting inherited value. For
-# triton / triton_unfused we hard-set AITER_MOE=0 so AITER doesn't get
-# pulled into unrelated code paths.
+# from the user's shell. For triton / triton_unfused we hard-set both AITER
+# and AITER_MOE to 0 so AITER doesn't get pulled into unrelated code paths.
 _force_env() {
     # _force_env NAME VALUE → export NAME=VALUE, warn if it overrode a
     # conflicting inherited value.
@@ -152,22 +107,14 @@ _force_env() {
     export "$name=$want"
 }
 # Force env only when MOE_BACKEND demands a specific AITER answer:
-#   aiter                       → AITER explicitly required; force both to 1
-#                                 so the oracle's "explicit AITER" branch
-#                                 returns it without further checks.
 #   triton | triton_unfused     → AITER explicitly NOT wanted; force both to 0
 #                                 so the oracle removes it from the candidate
 #                                 list (avoids noisy "AITER rejected" logs).
 #   auto                        → DON'T touch the env vars. vllm's defaults
 #                                 (AITER=False, AITER_MOE=True) let the
 #                                 oracle's normal is_supported_config() gate
-#                                 decide based on the actual GPU arch — works
-#                                 right on MI3xx (accepted) and gfx12 (rejected).
+#                                 decide based on the actual GPU arch.
 case "$MOE_BACKEND" in
-    aiter)
-        _force_env VLLM_ROCM_USE_AITER     1
-        _force_env VLLM_ROCM_USE_AITER_MOE 1
-        ;;
     triton|triton_unfused)
         # AITER not wanted here: MoE uses OAI triton_kernels, and the DSv4
         # Triton paths (blockscale GEMM, MHC, indexer, sparse-MLA, o-proj) are
