@@ -48,6 +48,18 @@ def aiter_triton_kernel_w4a8_moe_forward(
     )
     from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
 
+    # Map the gated-SwiGLU variant to the aiter `_swiglu` (alpha, limit) params:
+    #   SILU (DeepSeek-V4): plain SiLU-SwiGLU  -> alpha=1.0,   limit=None
+    #   SWIGLUOAI (gpt-oss): clamped sigmoid    -> alpha=1.702, limit=7.0
+    if activation == MoEActivation.SILU:
+        swiglu_alpha, swiglu_limit = 1.0, None
+    elif activation == MoEActivation.SWIGLUOAI:
+        swiglu_alpha, swiglu_limit = 1.702, 7.0
+    else:
+        raise ValueError(
+            f"aiter W4A8 MoE supports SILU/SWIGLUOAI, got {activation}"
+        )
+
     routing_data, gather_idx, scatter_idx = aiter_routing(
         gating_output, topk, sm_first=not renormalize
     )
@@ -60,6 +72,8 @@ def aiter_triton_kernel_w4a8_moe_forward(
         gather_idx,
         scatter_idx,
         activation=activation.value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
         quant_config=quant_config,
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=global_num_experts,
@@ -223,8 +237,11 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        # Only SILU activation (swiglu) is supported
-        return activation == MoEActivation.SWIGLUOAI
+        # Both plain SiLU-SwiGLU (DeepSeek-V4) and gpt-oss SWIGLUOAI are
+        # supported: the underlying aiter `_swiglu` kernel computes plain SiLU
+        # at alpha=1.0/limit=None and gpt-oss at alpha=1.702/limit=7.0
+        # (see aiter_triton_kernel_w4a8_moe_forward for the mapping).
+        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
 
     @staticmethod
     def _supports_parallel_config(
@@ -284,6 +301,7 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             gating_output=router_logits,
             topk=self.topk,
             renormalize=self.renormalize,
+            activation=activation,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             quant_config=self.quant_config,

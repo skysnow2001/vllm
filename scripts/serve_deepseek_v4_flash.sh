@@ -118,10 +118,10 @@ CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-PIECEWISE}"
 #                     below (otherwise the device gate trips on env, not arch).
 MOE_BACKEND="${MOE_BACKEND:-auto}"
 case "$MOE_BACKEND" in
-    auto|triton|triton_unfused|aiter) ;;
+    auto|triton|triton_unfused|aiter|emulation) ;;
     *)
         echo "[serve_deepseek_v4_flash] ERROR: invalid MOE_BACKEND='$MOE_BACKEND'" >&2
-        echo "  must be one of: auto, triton, triton_unfused, aiter" >&2
+        echo "  must be one of: auto, triton, triton_unfused, aiter, emulation" >&2
         exit 2
         ;;
 esac
@@ -169,7 +169,20 @@ case "$MOE_BACKEND" in
         _force_env VLLM_ROCM_USE_AITER_MOE 1
         ;;
     triton|triton_unfused)
-        _force_env VLLM_ROCM_USE_AITER     1
+        # AITER not wanted here: MoE uses OAI triton_kernels, and the DSv4
+        # Triton paths (blockscale GEMM, MHC, indexer, sparse-MLA, o-proj) are
+        # direct triton imports enabled by VLLM_DSV4_TRITON — not gated by
+        # rocm_aiter_ops.is_enabled(). Keeping AITER on pulls in the aiter
+        # sampler (top_k_top_p_sampling_from_probs) whose JIT .so fails to build
+        # on gfx12, crashing the profile run. Force both off → native sampler.
+        _force_env VLLM_ROCM_USE_AITER     0
+        _force_env VLLM_ROCM_USE_AITER_MOE 0
+        ;;
+    emulation)
+        # Modular Triton mxfp4-emulation experts (OCP_MXQuantizationEmulation
+        # TritonExperts). Routing is done in the layer (DeepSeek-V4 grouped
+        # routing supported); experts are vLLM-native Triton fused-MoE. Don't
+        # pull AITER into the MoE.
         _force_env VLLM_ROCM_USE_AITER_MOE 0
         ;;
     auto)

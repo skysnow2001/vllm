@@ -39,6 +39,22 @@ def has_aiter_triton_mhc() -> bool:
 # ---------------------------------------------------------------------------
 # mHC pre  (aiter.ops.triton.fusions.mhc.mhc)
 # ---------------------------------------------------------------------------
+# Cache hc_scale (a constant param) -> python float alphas, keyed by storage
+# pointer, so the GPU->CPU read happens once during eager warmup and never
+# inside a captured cudagraph (where a sync would abort capture).
+_HC_SCALE_FLOATS_CACHE: dict[tuple[int, int], tuple[float, float, float]] = {}
+
+
+def _hc_scale_floats(hc_scale: torch.Tensor) -> tuple[float, float, float]:
+    key = (hc_scale.data_ptr(), hc_scale.numel())
+    vals = _HC_SCALE_FLOATS_CACHE.get(key)
+    if vals is None:
+        a_pre, a_post, a_res = (float(v) for v in hc_scale.tolist())
+        vals = (a_pre, a_post, a_res)
+        _HC_SCALE_FLOATS_CACHE[key] = vals
+    return vals
+
+
 def mhc_pre_aiter_triton(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -60,8 +76,11 @@ def mhc_pre_aiter_triton(
 
     x = residual.reshape(M, hc_mult * hidden)
     phi = fn.t().to(residual.dtype).contiguous()  # (K, N)
-    # aiter's `mhc` takes per-stream alphas as python floats (host read).
-    a_pre, a_post, a_res = (float(v) for v in hc_scale.tolist())
+    # aiter's `mhc` takes per-stream alphas as python floats. Reading them off
+    # the device is a GPU->CPU sync that would abort a FULL cudagraph capture,
+    # so cache by tensor identity: hc_scale is a constant parameter, populated
+    # during eager warmup before capture, then reused sync-free under capture.
+    a_pre, a_post, a_res = _hc_scale_floats(hc_scale)
 
     h_post, h_res, layer_input = aiter_mhc(
         x,
@@ -236,15 +255,14 @@ def _mhc_fused_post_pre_aiter_triton_fake(
     return residual_out, post_mix, comb_mix, layer_input
 
 
-# mhc_pre reads hc_scale to host (python floats for aiter's scalar args), so it
-# is cudagraph-unsafe — tag it for a graph break. mhc_post / mhc_post_pre keep
-# everything on-device (alphas stays a tensor) and are capture-safe.
+# mhc_pre's only host read (hc_scale -> floats) is cached in _hc_scale_floats,
+# so under capture it's sync-free and cudagraph-safe (no tag). mhc_post /
+# mhc_post_pre keep everything on-device (alphas stays a tensor) too.
 direct_register_custom_op(
     op_name="mhc_pre_aiter_triton",
     op_func=mhc_pre_aiter_triton,
     mutates_args=[],
     fake_impl=_mhc_pre_aiter_triton_fake,
-    tags=(torch._C.Tag.cudagraph_unsafe,),
 )
 direct_register_custom_op(
     op_name="mhc_post_aiter_triton",

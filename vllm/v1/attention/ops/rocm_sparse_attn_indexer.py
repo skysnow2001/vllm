@@ -557,15 +557,25 @@ def rocm_sparse_attn_indexer_no_insert_fake(
 
 # Register as a vllm custom op so vllm's compile / dispatch infrastructure
 # treats it the same as the existing sparse_attn_indexer ops.
+#
+# cudagraph safety is path-dependent:
+#  * VLLM_DSV4_TRITON=1: decode runs the Triton paged-MQA-logits kernel
+#    (rocm_fp8_paged_mqa_logits), which is host-sync-free -> the op is
+#    FULL-cudagraph-safe for the decode phase, so we DON'T tag it unsafe.
+#    (Prefill still uses Python-loop torch fallbacks, but under
+#    FULL_DECODE_ONLY prefill runs eager/uncaptured, so that's fine.)
+#  * default (torch path): decode uses _mqa_logits_paged_torch, a Python
+#    block-table loop driven by GPU values (.tolist()/.item()) that is
+#    incompatible with cudagraph capture -> tag cudagraph_unsafe so piecewise
+#    compile graph-breaks around it.
+_indexer_no_insert_tags = (
+    () if envs.VLLM_DSV4_TRITON else (torch._C.Tag.cudagraph_unsafe,)
+)
 direct_register_custom_op(
     op_name="rocm_sparse_attn_indexer_no_insert",
     op_func=rocm_sparse_attn_indexer_no_insert,
     mutates_args=["topk_indices_buffer"],
     fake_impl=rocm_sparse_attn_indexer_no_insert_fake,
     dispatch_key=current_platform.dispatch_key,
-    # Eager fallback: uses Python loops driven by GPU values
-    # (.tolist()/.item()), which is incompatible with CUDA graph capture.
-    # Tag as cudagraph_unsafe so vLLM's piecewise compile inserts a graph
-    # break around this op and runs it eagerly between captured pieces.
-    tags=(torch._C.Tag.cudagraph_unsafe,),
+    tags=_indexer_no_insert_tags,
 )

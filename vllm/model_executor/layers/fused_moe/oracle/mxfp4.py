@@ -1524,8 +1524,11 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
-    elif mxfp4_backend == Mxfp4MoeBackend.XPU:
-        # No additional transformation needed for XPU backend
+    elif mxfp4_backend in (Mxfp4MoeBackend.XPU, Mxfp4MoeBackend.EMULATION):
+        # No additional transformation needed: XPU and the OCP-MX EMULATION
+        # path keep the packed mxfp4 weights as-is. EMULATION
+        # (OCP_MXQuantizationEmulationTritonExperts) dequantizes the raw
+        # uint8 weights to bf16 on the fly inside apply().
         return (
             w13_weight,
             w2_weight,
@@ -1537,7 +1540,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM, Triton, AITER, or XPU backend."
+            f"Expected TRTLLM, Triton, AITER, XPU, or EMULATION backend."
         )
 
 
