@@ -7,11 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm.config import get_current_vllm_config
-from vllm.model_executor.layers.fused_moe import (
-    MoERunner,
-    RoutedExperts,
-    UnquantizedFusedMoEMethod,
-)
+from vllm.model_executor.layers.fused_moe import MoERunner, UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
@@ -20,51 +16,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
-
-# Map ``quantization_config.quant_method`` values that may be observed in the
-# wild to the DeepSeek V4 expert layout they imply. Used as a secondary signal
-# when ``hf_config.expert_dtype`` is missing (some FP8 checkpoints, including
-# DeepSeek-V4-Flash-Base-FP8, ship without it).
-_QUANT_METHOD_TO_EXPERT_DTYPE = {
-    "fp8": "fp8",
-    "deepseek_v4_fp8": "fp8",
-    "mxfp4": "fp4",
-    "fp4": "fp4",
-    "nvfp4": "fp4",
-}
-
-
-def _resolve_deepseek_v4_expert_dtype(hf_config) -> str:
-    """Return the DeepSeek V4 expert layout, inferring it when needed.
-
-    Resolution order:
-
-      1. Honor ``hf_config.expert_dtype`` if present (authoritative).
-      2. Otherwise, peek at ``hf_config.quantization_config.quant_method``
-         and map it via ``_QUANT_METHOD_TO_EXPERT_DTYPE`` so an FP8
-         checkpoint without an explicit ``expert_dtype`` field still
-         picks the FP8 expert dispatch instead of falling through to the
-         MXFP4 path.
-      3. Fall back to ``"fp4"`` (matches upstream's historical default
-         for legacy DSv4 checkpoints).
-    """
-    explicit = getattr(hf_config, "expert_dtype", None)
-    if explicit is not None:
-        return explicit
-
-    qcfg = getattr(hf_config, "quantization_config", None)
-    if qcfg is not None:
-        if isinstance(qcfg, dict):
-            quant_method = qcfg.get("quant_method")
-        else:
-            quant_method = getattr(qcfg, "quant_method", None)
-        if quant_method is not None:
-            inferred = _QUANT_METHOD_TO_EXPERT_DTYPE.get(quant_method)
-            if inferred is not None:
-                return inferred
-
-    return "fp4"
-
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.modelopt import (
@@ -109,7 +60,7 @@ class DeepseekV4FP8Config(Fp8Config):
                 # vllm_config not yet set; defer the decision until a
                 # later call lands inside set_current_vllm_config.
                 return "fp4"
-            expert_dtype = _resolve_deepseek_v4_expert_dtype(hf_config)
+            expert_dtype = getattr(hf_config, "expert_dtype", "fp4")
             if expert_dtype not in _DEEPSEEK_V4_EXPERT_DTYPES:
                 raise ValueError(
                     f"Unsupported DeepSeek V4 expert_dtype={expert_dtype!r}; "
@@ -178,10 +129,7 @@ class DeepseekV4FP8Config(Fp8Config):
         return None
 
     def get_quant_method(self, layer, prefix):
-        # Both the MoERunner (compute) and the RoutedExperts (weight container)
-        # call get_quant_method; route both through the expert_dtype-aware
-        # branch so MXFP4 experts don't fall through to the base FP8 method.
-        if isinstance(layer, (MoERunner, RoutedExperts)):
+        if isinstance(layer, MoERunner):
             if is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
@@ -204,6 +152,6 @@ class DeepseekV4FP8Config(Fp8Config):
         return super().get_quant_method(layer, prefix)
 
     def is_mxfp4_quant(self, prefix, layer):
-        if not isinstance(layer, (MoERunner, RoutedExperts)) or self.expert_dtype != "fp4":
+        if not isinstance(layer, MoERunner) or self.expert_dtype != "fp4":
             return False
         return self.moe_quant_algo != "NVFP4"

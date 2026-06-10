@@ -48,9 +48,6 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.models.deepseek_v4.quant_config import (
-    _resolve_deepseek_v4_expert_dtype,
-)
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -764,7 +761,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = _resolve_deepseek_v4_expert_dtype(config)
+        expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 

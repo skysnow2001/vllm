@@ -57,9 +57,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.deepseek_v4.quant_config import (
-    _resolve_deepseek_v4_expert_dtype,
-)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -513,7 +510,7 @@ class DeepseekV4MoE(nn.Module):
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently supports sqrtsoftplus routing only."
             )
-        if self.use_mega_moe and _resolve_deepseek_v4_expert_dtype(config) != "fp4":
+        if self.use_mega_moe and getattr(config, "expert_dtype", "fp4") != "fp4":
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE only supports fp4 experts; got expert_dtype="
                 f"{config.expert_dtype!r}. Drop --kernel-config moe_backend="
@@ -1256,7 +1253,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
 
         config = vllm_config.model_config.hf_config
         self.config = config
-        expert_dtype = _resolve_deepseek_v4_expert_dtype(config)
+        expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 
