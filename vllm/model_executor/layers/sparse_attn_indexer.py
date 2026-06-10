@@ -515,9 +515,6 @@ class SparseAttnIndexer(CustomOp):
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
 
-        # The aiter sparse-attention indexer handles the DeepSeek-V4
-        # pre-inserted-K layout (skip_k_cache_insert / k=None) and has
-        # non-gfx942 Triton paths, so it runs on gfx12 with AITER enabled.
         if rocm_aiter_ops.is_enabled():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
