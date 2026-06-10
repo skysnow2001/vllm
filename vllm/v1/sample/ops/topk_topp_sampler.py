@@ -12,6 +12,12 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
 
+try:
+    # gfx12/RDNA4 detection for the aiter-sampler guard below.
+    from vllm.platforms.rocm import _ON_GFX12X
+except Exception:
+    _ON_GFX12X = False
+
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
 
@@ -110,6 +116,11 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in ("processed_logits", "processed_logprobs")
             and rocm_aiter_ops.is_enabled()
+            # The aiter sampler (top_k_top_p_sampling_from_probs) is gfx9x-only:
+            # sampling.cuh hardcodes WARP_SIZE=64, so its JIT .so fails to build
+            # on gfx12/RDNA4 (32-lane). Fall back to the native sampler there
+            # even when AITER is otherwise enabled.
+            and not _ON_GFX12X
         ):
             try:
                 import aiter.ops.sampling  # noqa: F401
