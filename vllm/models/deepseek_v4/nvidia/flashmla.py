@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm.forward_context import get_forward_context
-from vllm.platforms import current_platform
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
@@ -210,17 +209,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 f"Unsupported compress_ratio={self.compress_ratio}; "
                 "expected 1, 4, or 128."
             )
-        # FlashMLA's tile-scheduler metadata is NVIDIA-only planner state
-        # consumed by the C++/CUDA kernel. The ROCm fallback discards it and
-        # DeepseekSparseSWAMetadataBuilder.build_tile_scheduler skips allocating
-        # it on ROCm — so None is expected on AMD and only an error on CUDA.
-        if not current_platform.is_rocm():
-            assert tile_metadata is not None, (
-                "swa_metadata missing tile_sched entry for "
-                f"compress_ratio={self.compress_ratio}; "
-                "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
-                "allocate one for this layer type."
-            )
+        assert tile_metadata is not None, (
+            "swa_metadata missing tile_sched entry for "
+            f"compress_ratio={self.compress_ratio}; "
+            "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
+            "allocate one for this layer type."
+        )
 
         out, _ = flash_mla_with_kvcache(
             q=q,
