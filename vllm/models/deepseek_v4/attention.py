@@ -25,7 +25,6 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
-    quantize_and_insert_k_cache,
 )
 
 if TYPE_CHECKING:
@@ -45,7 +44,6 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.platforms import current_platform
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.utils.multi_stream_utils import (
@@ -95,106 +93,6 @@ def _resolve_dsv4_kv_cache_dtype(
         return kv_cache_dtype, torch.float8_e4m3fn
     # auto / bfloat16 -> plain bf16 KV row.
     return kv_cache_dtype, torch.bfloat16
-
-
-def _apply_rope_gptj_last_dims(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    rope_dim: int,
-) -> torch.Tensor:
-    """GPT-J-style (interleaved-pair) RoPE on the last rope_dim elements.
-
-    Numerically matches ``fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`` /
-    tests in ``test_fused_deepseek_v4_qnorm_rope_kv_insert``.
-    """
-    half = rope_dim // 2
-    head_dim = x.shape[-1]
-    nope_dim = head_dim - rope_dim
-
-    cs = cos_sin_cache[positions].to(torch.float32)
-    cos = cs[..., :half]
-    sin = cs[..., half:]
-
-    rope = x[..., nope_dim:].float()
-    shape = rope.shape
-    rope = rope.reshape(*shape[:-1], half, 2)
-    even = rope[..., 0]
-    odd = rope[..., 1]
-
-    for _ in range(rope.ndim - 3):
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-
-    new_even = even * cos - odd * sin
-    new_odd = even * sin + odd * cos
-    rope_rotated = torch.stack((new_even, new_odd), dim=-1).reshape(shape)
-
-    out = x.clone().float()
-    out[..., nope_dim:] = rope_rotated
-    return out.to(x.dtype)
-
-
-def _deepseek_v4_qnorm_rope_kv_insert_reference(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    k_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    q_head_padded: int,
-    eps: float,
-    cache_block_size: int,
-    rope_dim: int,
-) -> torch.Tensor:
-    """PyTorch/Triton reference for ROCm builds where the fused CUDA op is absent.
-
-    Returns a ``[num_tokens, q_head_padded, head_dim]`` tensor with the q-side
-    normalised + RoPE-rotated values in the leading ``n_local_heads`` slots and
-    zeros in the trailing padding slots (matching the C++ kernel's output
-    contract). As a side effect, writes the RoPE-rotated, UE8M0-quantised KV
-    block into ``k_cache`` at the positions described by ``slot_mapping``.
-
-    The C++ kernel applies a weight-free per-head RMSNorm to ``q``; replicated
-    here in fp32 so there is no dependency on a registered norm submodule.
-    """
-    num_tokens, n_local_heads, head_dim = q.shape
-
-    q_f = q.reshape(-1, head_dim).float()
-    q_normed = q_f * torch.rsqrt(q_f.pow(2).mean(-1, keepdim=True) + eps)
-    q_out_inner = _apply_rope_gptj_last_dims(
-        q_normed.to(q.dtype).view_as(q),
-        positions,
-        cos_sin_cache,
-        rope_dim,
-    )
-
-    if q_head_padded == n_local_heads:
-        q_out = q_out_inner
-    else:
-        q_out = torch.zeros(
-            (num_tokens, q_head_padded, head_dim),
-            dtype=q.dtype,
-            device=q.device,
-        )
-        q_out[:, :n_local_heads, :] = q_out_inner
-
-    num_tokens_insert = slot_mapping.shape[0]
-    if num_tokens_insert == 0:
-        return q_out
-
-    kv_slice = kv[:num_tokens_insert]
-    pos_slice = positions[:num_tokens_insert]
-    kv_roped = _apply_rope_gptj_last_dims(
-        kv_slice, pos_slice, cos_sin_cache, rope_dim
-    )
-    quantize_and_insert_k_cache(
-        kv_roped,
-        k_cache,
-        slot_mapping,
-        block_size=cache_block_size,
-    )
-    return q_out
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
@@ -647,28 +545,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            # The fused C++ kernel is registered only for CUDA, and its FP8
-            # dtype is selected at *compile time* via ``HIP_FP8_TYPE_OCP``
-            # whereas MI300X (gfx942) is FNUZ-only at runtime — a mismatch
-            # silently corrupts every K byte written to the SWA cache. Always
-            # use the Python/Triton reference on ROCm (the C++ kernel is
-            # unavailable there).
-            use_torch_ref = current_platform.is_rocm()
-
-            if not use_torch_ref:
-                return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-                    q,
-                    kv,
-                    swa_kv_cache_2d,
-                    swa_metadata.slot_mapping,
-                    positions,
-                    cos_sin_cache,
-                    self.padded_heads,
-                    self.eps,
-                    swa_metadata.block_size,
-                )
-
-            return _deepseek_v4_qnorm_rope_kv_insert_reference(
+            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
@@ -678,7 +555,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.padded_heads,
                 self.eps,
                 swa_metadata.block_size,
-                self.rope_head_dim,
             )
 
         # FlashInfer full-cache path: the [num_blocks, block_size, 512] cache
