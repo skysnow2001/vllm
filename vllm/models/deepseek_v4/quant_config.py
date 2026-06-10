@@ -7,7 +7,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm.config import get_current_vllm_config
-from vllm.model_executor.layers.fused_moe import MoERunner, UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe import (
+    MoERunner,
+    RoutedExperts,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
@@ -174,7 +178,10 @@ class DeepseekV4FP8Config(Fp8Config):
         return None
 
     def get_quant_method(self, layer, prefix):
-        if isinstance(layer, MoERunner):
+        # Both the MoERunner (compute) and the RoutedExperts (weight container)
+        # call get_quant_method; route both through the expert_dtype-aware
+        # branch so MXFP4 experts don't fall through to the base FP8 method.
+        if isinstance(layer, (MoERunner, RoutedExperts)):
             if is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
@@ -197,6 +204,6 @@ class DeepseekV4FP8Config(Fp8Config):
         return super().get_quant_method(layer, prefix)
 
     def is_mxfp4_quant(self, prefix, layer):
-        if not isinstance(layer, MoERunner) or self.expert_dtype != "fp4":
+        if not isinstance(layer, (MoERunner, RoutedExperts)) or self.expert_dtype != "fp4":
             return False
         return self.moe_quant_algo != "NVFP4"
