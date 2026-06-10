@@ -515,31 +515,9 @@ class SparseAttnIndexer(CustomOp):
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
 
-        # Default ROCm path: the compressor has already inserted K
-        # (skip_k_cache_insert=True) and AITER is off, so we run the Triton
-        # MQA-logits sparse indexer.
-        # VLLM_DSV4_TRITON forces this Triton path even when aiter is otherwise
-        # enabled (the aiter indexer needs the gfx-gated paged MQA-logits).
-        if self.skip_k_cache_insert and (
-            envs.VLLM_DSV4_TRITON or not rocm_aiter_ops.is_enabled()
-        ):
-            # Import lazily so non-ROCm builds don't pay the import cost.
-            import vllm.v1.attention.ops.rocm_sparse_attn_indexer  # noqa: F401
-
-            return torch.ops.vllm.rocm_sparse_attn_indexer_no_insert(
-                hidden_states,
-                _encode_layer_name(self.k_cache.prefix),
-                self.k_cache.kv_cache,
-                q_quant,
-                weights,
-                self.quant_block_size,
-                self.scale_fmt,
-                self.topk_tokens,
-                self.head_dim,
-                self.max_model_len,
-                self.max_total_seq_len,
-                self.topk_indices_buffer,
-            )
+        # The aiter sparse-attention indexer handles the DeepSeek-V4
+        # pre-inserted-K layout (skip_k_cache_insert / k=None) and has
+        # non-gfx942 Triton paths, so it runs on gfx12 with AITER enabled.
         if rocm_aiter_ops.is_enabled():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
