@@ -6,7 +6,11 @@ Triton kernel wiring, FULL-cudagraph host-sync fixes, third-party package
 patches, and disabling gfx9x-only kernels. Full list below.
 
 Final working config:
-`VLLM_DSV4_TRITON=1  MOE_BACKEND=triton_unfused  VLLM_ROCM_USE_AITER=0  CUDAGRAPH_MODE=FULL_DECODE_ONLY  TP=8`
+`VLLM_DSV4_TRITON=1  MOE_BACKEND=triton_unfused  VLLM_ROCM_USE_AITER=1  VLLM_ROCM_USE_AITER_MOE=0  CUDAGRAPH_MODE=FULL_DECODE_ONLY  TP=8`
+
+(AITER is **on** so the sparse-attention indexer uses the upstreamed aiter
+`rocm_aiter_sparse_attn_indexer` op; the gfx9x-only aiter sampler is skipped
+in-code on gfx12, and MoE stays on `triton_unfused` via `AITER_MOE=0`.)
 
 ---
 
@@ -27,30 +31,45 @@ Also: **rebuilt the vLLM C++/HIP extensions** (`_C`, `_rocm_C`, `_moe_C`,
 
 ## 2. Env switches (code)
 - **New `VLLM_DSV4_TRITON`** (`vllm/envs.py`): master "all-Triton on gfx12"
-  switch — forces aiter-Triton linear/blockscale + o-proj, keeps the Triton
-  sparse indexer, decouples qnorm from the CK path.
+  switch — forces aiter-Triton linear/blockscale GEMMs.
+- **`VLLM_ROCM_USE_AITER=1`, `VLLM_ROCM_USE_AITER_MOE=0`**: AITER on enables the
+  aiter sparse-attention indexer op (which already handles the V4 pre-inserted-K
+  layout and has non-gfx942 Triton paths); MoE stays on `triton_unfused`.
 - The fused Triton sparse-MLA backend (`rocm_aiter_mla_sparse`, upstreamed via
-  main) is the only ROCm sparse-MLA path; the qnorm-rope-kv-insert always uses
-  the Python/Triton reference on ROCm (the C++ kernel is CUDA-only).
+  main) is the only ROCm sparse-MLA path; the qnorm-rope-kv-insert uses main's
+  fused `_C` kernel (`fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`), which
+  builds and runs on gfx1201 after rebuilding `_C_stable_libtorch` — `attention.py`
+  needs no gfx12 change.
+- **RoutedExperts quant fix** (`models/deepseek_v4/quant_config.py`): main's MoE
+  refactor (PR #41184) split the MoE into `MoERunner` + `RoutedExperts`, but the
+  DeepSeek-V4 quant override only matched `MoERunner`, so the `RoutedExperts`
+  weight container fell through to the FP8 method and rejected
+  `--moe-backend=triton_unfused`. Fixed to `isinstance(layer, (MoERunner,
+  RoutedExperts))` so MXFP4 (`expert_dtype="fp4"`) experts get `Mxfp4MoEMethod`.
 
 ## 3. Triton kernel wiring (code)
-- **Sparse-MLA attention** is the default ROCm impl
-  (`models/deepseek_v4/attention.py:_select_v4_sparse_impl`).
+- **Sparse-MLA attention** uses the upstreamed ROCm impl
+  `DeepseekV4ROCMAiterMLAAttention` (`models/deepseek_v4/amd/rocm.py`), selected
+  by the AMD model module.
 - **aiter linear/GEMM flags honor `VLLM_DSV4_TRITON`**
   (`vllm/_aiter_ops.py:is_linear_enabled / is_triton_gemm_enabled`) — selects
   the aiter-Triton blockscale GEMM **without** flipping global `is_enabled()`.
 - **Blockscale GEMM forced to Triton** (`scaled_mm/aiter.py:use_triton`).
-- **O-proj grouped GEMM → Triton**: `rocm_aiter_mla_sparse.py:
-  _rocm_triton_grouped_oproj_gemm` (aiter `batched_gemm_bf16`, with an explicit
-  launch config since aiter ships no `gfx1201-BATCHED_GEMM-A16W16` json).
+- **O-proj wo_a GEMM → `torch.einsum` (rocBLAS)**, same as CDNA. (A Triton
+  `batched_gemm_bf16` path was tried but benchmarked ~1.3–1.8× *slower* on
+  gfx1201 for this shape — B=n_local_groups=1, K=4096, N=1024 — since rocBLAS
+  already works natively, so it was removed.)
 - **MHC → aiter Triton**: new adapter `kernels/mhc/aiter_triton.py`
   (`mhc_pre/post/fused_post_pre_aiter_triton` wrapping
   `aiter.ops.triton.fusions.mhc`), wired in `layers/mhc.py` via
   `HAS_AITER_TRITON_MHC`.
-- **Indexer decode → non-gluon JIT**: `paged_mqa_logits_module()` forces
-  `enable_gluon_pa_mqa_logits=False` (gluon is gfx950/gfx1250-only); the Triton
-  no-insert indexer is the default ROCm path
-  (`layers/sparse_attn_indexer.py`).
+- **Indexer → aiter op, non-gluon JIT**: the ROCm `SparseAttnIndexer` dispatches
+  to the upstreamed aiter `rocm_aiter_sparse_attn_indexer`
+  (`layers/sparse_attn_indexer.py`); `paged_mqa_logits_module()` forces
+  `enable_gluon_pa_mqa_logits=False` (gluon is gfx942/gfx950-only) so the decode
+  logits land on the portable Triton `deepgemm_fp8_paged_mqa_logits_stage1`.
+  (An earlier custom `rocm_sparse_attn_indexer.py` was removed once the aiter op
+  was found to handle the V4 pre-inserted-K layout on gfx12.)
 - **MoE → `triton_unfused`** (OAI `triton_kernels` MoE, modular so the layer
   does DeepSeek-V4 grouped routing). (Also patched the aiter W4A8 path —
   SILU activation support + `(alpha,limit)` mapping in
@@ -64,11 +83,10 @@ syncs and `cudagraph_unsafe` ops:
   aiter `mhc` kernel takes alphas as Python floats → `hc_scale.tolist()` was a
   GPU→CPU sync that aborts capture. Cache the (constant) floats once during
   warmup → sync-free under capture. Dropped its `cudagraph_unsafe` tag.
-- **Indexer op tag made conditional** (`rocm_sparse_attn_indexer.py`): drop
-  `cudagraph_unsafe` under `VLLM_DSV4_TRITON` (decode path is the sync-free
-  Triton kernel; prefill runs eager under FULL_DECODE_ONLY).
-- Decouple qnorm/indexer from the env so the default Triton path stays
-  self-consistent.
+- The aiter indexer op (`rocm_aiter_sparse_attn_indexer`) is registered as a
+  splitting op in `config/compilation.py:_attention_ops`, so it's a graph
+  boundary (eager) under PIECEWISE and captured cleanly under FULL_DECODE_ONLY.
+- Decouple qnorm from the env so the default Triton path stays self-consistent.
 
 Result: decode TPOT 186 ms (piecewise) → **48 ms** (full), ~3.9×.
 
@@ -83,10 +101,12 @@ Result: decode TPOT 186 ms (piecewise) → **48 ms** (full), ~3.9×.
   correct vs torch routing).
 
 ## 6. Disabling gfx9x-only kernels + a missing config
-- **Sampler → native** (`VLLM_ROCM_USE_AITER=0` for triton_unfused in
-  `serve_deepseek_v4_flash.sh`): aiter's `top_k_top_p_sampling_from_probs`
-  hardcodes CDNA's 64-lane wavefront (`WARP_SIZE=64`, 64-lane shfl masks) → JIT
-  build fails on RDNA4. vLLM's native sampler is correct on any arch.
+- **Sampler → native on gfx12** (`v1/sample/ops/topk_topp_sampler.py`): aiter's
+  `top_k_top_p_sampling_from_probs` hardcodes CDNA's 64-lane wavefront
+  (`WARP_SIZE=64`, 64-lane shfl masks) → JIT build fails on RDNA4. Since AITER is
+  now **on** (for the indexer), the sampler can't be disabled via the global
+  flag; instead it's skipped in-code with an `_ON_GFX12X` guard, so gfx12 uses
+  vLLM's native sampler while CDNA still gets the aiter one.
 - **`gfx1201-MHC_POST.json`** tuning config added (aiter's
   `get_mhc_post_config` has no gfx942 fallback → `FileNotFoundError` otherwise).
 
@@ -96,11 +116,12 @@ Result: decode TPOT 186 ms (piecewise) → **48 ms** (full), ~3.9×.
 | Category | Tweaks |
 |---|---|
 | Deps/build | torch 2.12, torchvision 0.27, compressed-tensors 0.17, kernels 0.12.3, rebuild `_C*` |
-| Env | new `VLLM_DSV4_TRITON` master switch |
-| Triton wiring | sparse-MLA default, aiter linear/blockscale, o-proj GEMM, MHC, indexer (gluon-off), MoE `triton_unfused` |
-| FULL cudagraph | hc_scale host-sync cache; conditional `cudagraph_unsafe` tag |
+| Env | new `VLLM_DSV4_TRITON`; AITER on + `AITER_MOE=0` |
+| Triton wiring | sparse-MLA default, aiter linear/blockscale, MHC, aiter indexer (gluon-off), MoE `triton_unfused` (o-proj GEMM stays rocBLAS einsum) |
+| Quant fix | RoutedExperts → MXFP4 method (PR #41184 regression) |
+| FULL cudagraph | hc_scale host-sync cache; indexer in `_attention_ops` |
 | 3rd-party | OAI `triton_kernels` install + top-k=6 pow2 patch |
-| gfx9x-only | native sampler (disable aiter sampler); `gfx1201-MHC_POST.json` |
+| gfx9x-only | native sampler via in-code `_ON_GFX12X` guard; `gfx1201-MHC_POST.json` |
 
 So: the env var + the cache fix were two of many — the bulk was **(a) bringing
 the dependency/build stack to torch 2.12**, **(b) routing every CK/ASM/gfx9x

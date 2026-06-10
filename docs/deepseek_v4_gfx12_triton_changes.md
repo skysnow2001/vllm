@@ -4,13 +4,16 @@ Goal: run DeepSeek-V4-Flash on 8× Navi48 (gfx1201) under **FULL_DECODE_ONLY**
 cudagraph using **Triton** kernels only — CDNA-only CK / ASM / TileLang /
 FlashMLA / DeepGEMM kernels do not build/run on RDNA4.
 
-Everything is gated by one master switch, **`VLLM_DSV4_TRITON`** (+
-`current_platform.is_rocm()`). With the switch off, behavior is identical to
-upstream `main`. Net code delta vs `origin/main`: **15 files, ~1264 / −28**.
+The Triton kernel selection is gated by **`VLLM_DSV4_TRITON`** (+
+`current_platform.is_rocm()`); AITER is also turned **on**
+(`VLLM_ROCM_USE_AITER=1`, `VLLM_ROCM_USE_AITER_MOE=0`) so the upstreamed aiter
+sparse-attention indexer op is reachable, with the gfx9x-only aiter sampler
+skipped in-code on gfx12.
 
-The ROCm sparse-MLA *attention backend* itself (`rocm_sparse_attn_decode` /
-`rocm_sparse_attn_prefill`, `DeepseekV4ROCMAiterMLAAttention`) was upstreamed by
-`main`; the changes below are the gfx12 Triton wiring layered on top.
+The ROCm sparse-MLA *attention backend* and the *sparse indexer*
+(`rocm_aiter_mla_sparse`, `rocm_aiter_sparse_attn_indexer`,
+`DeepseekV4ROCMAiterMLAAttention`) were upstreamed by `main`; the changes below
+are the gfx12 Triton wiring + fixes layered on top.
 
 ---
 
@@ -20,16 +23,17 @@ The ROCm sparse-MLA *attention backend* itself (`rocm_sparse_attn_decode` /
 |---|---|---|
 | `vllm/envs.py` | New `VLLM_DSV4_TRITON` master switch (+15) | Force aiter-Triton variants over CK/ASM, independent of global aiter enablement |
 | `vllm/_aiter_ops.py` | `is_linear_enabled()` / `is_triton_gemm_enabled()` also true under switch; `if_aiter_supported`→True; gluon paths forced off; fp8 `paged_mqa_logits` loader gated on switch (+13) | Make aiter Triton ops selectable on gfx12; gluon kernels don't run on RDNA4 |
-| `vllm/config/compilation.py` | cudagraph tag tweak (+1) | Allow FULL_DECODE_ONLY capture of the sparse path |
+| `scripts/serve_deepseek_v4_flash.sh` | `VLLM_ROCM_USE_AITER=1`, `VLLM_ROCM_USE_AITER_MOE=0` | AITER on → aiter sparse-attention indexer usable; MoE stays `triton_unfused` |
+| `vllm/v1/sample/ops/topk_topp_sampler.py` | `_ON_GFX12X` guard → native sampler on gfx12 even with AITER on | aiter sampler is gfx9x-only (`WARP_SIZE=64`) |
 
 ## 2. Sparse MLA attention
 
 | File | Change | Why |
 |---|---|---|
-| `vllm/v1/attention/ops/rocm_sparse_attn_indexer.py` | **New** Triton fp8 paged MQA-logits sparse indexer (+581) | gfx12 indexer (no CK/gluon) |
-| `vllm/model_executor/layers/sparse_attn_indexer.py` | Dispatch ROCm `SparseAttnIndexer` to the Triton path (+26) | Default when AITER off / forced by switch |
-| `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py` | `rocm_inv_rope_einsum` o-proj uses an explicit-config aiter `batched_gemm_bf16` Triton GEMM under switch, torch.einsum fallback (+61) | No gfx1201 BATCHED_GEMM tuning json exists |
-| `vllm/models/deepseek_v4/attention.py` | qnorm+RoPE+KV-insert torch/Triton reference (`_deepseek_v4_qnorm_rope_kv_insert_reference`, `_apply_rope_gptj_last_dims`) used on ROCm (+126) | Fused `_C` op is CUDA-only and its FP8 type (OCP vs FNUZ) is wrong on ROCm |
+| `vllm/model_executor/layers/sparse_attn_indexer.py` | ROCm `SparseAttnIndexer` dispatches to the aiter `rocm_aiter_sparse_attn_indexer` op | aiter op handles V4 pre-inserted-K (`skip_k_cache_insert`/`k=None`) + non-gfx942 Triton |
+| `vllm/_aiter_ops.py` (`paged_mqa_logits_module`) | gluon dispatch forced off → portable Triton `deepgemm_fp8_paged_mqa_logits_stage1` | aiter's default gluon `pa_mqa_logits` is gfx942/gfx950-only |
+| `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py` | o-proj `rocm_inv_rope_einsum` keeps `torch.einsum` (rocBLAS) — an aiter `batched_gemm_bf16` Triton path was tried then removed (benchmarked ~1.3–1.8× slower on gfx1201 at B=1, K=4096, N=1024) | rocBLAS works natively on ROCm; no Triton replacement needed (same as CDNA) |
+| qnorm+RoPE+KV-insert (`attention.py`) | uses main's fused `_C` kernel `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert` — **no gfx12 code** (`attention.py` identical to main) | the `_C` kernel is 32-lane + OCP-fp8 safe; just rebuilt into `_C_stable_libtorch` for gfx1201 (only the build arch list was needed) |
 
 ## 3. MHC (hyper-connection)
 
@@ -61,7 +65,7 @@ the router pow2 patch above. The earlier `aiter` (AITER_MXFP4_FP8) and
 
 | File | Change | Why |
 |---|---|---|
-| `vllm/models/deepseek_v4/quant_config.py` | `_resolve_deepseek_v4_expert_dtype` infers expert layout when `expert_dtype` missing (+47) | DSv4-Flash FP8 checkpoint has no explicit `expert_dtype` |
+| `vllm/models/deepseek_v4/quant_config.py` | `_resolve_deepseek_v4_expert_dtype` infers expert layout when `expert_dtype` missing (+47); **`get_quant_method`/`is_mxfp4_quant` match `(MoERunner, RoutedExperts)`** | (1) DSv4-Flash FP8 checkpoint has no explicit `expert_dtype`; (2) PR #41184 regression — `RoutedExperts` (the actual `get_quant_method` caller) missed the `MoERunner`-only check → MXFP4 experts fell through to FP8 and rejected `triton_unfused` |
 | `vllm/models/deepseek_v4/amd/model.py` | Import fix after main's refactor (+5) | Use main's `DeepseekV4ROCMAiterMLAAttention` + `_resolve_deepseek_v4_expert_dtype` |
 | `vllm/models/deepseek_v4/nvidia/model.py` | Import fix (+7) | main-refactor resolution |
 | `vllm/models/deepseek_v4/nvidia/flashmla.py` | `not is_rocm()` guard on a tile-metadata assert (+18) | Shared FlashMLA metadata is subclassed on ROCm |
@@ -74,7 +78,9 @@ the router pow2 patch above. The earlier `aiter` (AITER_MXFP4_FP8) and
 |---|---|
 | `vllm/v1/attention/ops/rocm_flash_mla_sparse.py` (−651) + its `ops/flashmla.py` ROCm elif | main upstreamed `rocm_sparse_attn_decode/prefill`; the FlashMLA torch fallback is never called on ROCm (`get_mla_metadata` is skipped for `is_rocm()`). ROCm falls through to the existing raising-stub `else` branch. |
 | `VLLM_ROCM_USE_V4_TRITON_FALLBACK` env | Its only consumer was the runtime selector main removed + the deleted fallback file; toggled nothing. |
-| aiter `dsv4_qnorm_rope_kv_insert.py` copies | Never wired — the torch reference is used instead. |
+| aiter `dsv4_qnorm_rope_kv_insert.py` copies | Never wired — the fused `_C` kernel (rebuilt for gfx1201) is used instead. |
+| qnorm torch reference (`_deepseek_v4_qnorm_rope_kv_insert_reference`, `_apply_rope_gptj_last_dims`) | Removed once the fused `_C` kernel was confirmed working on gfx12 — `attention.py` is now identical to main. |
+| `vllm/v1/attention/ops/rocm_sparse_attn_indexer.py` (−581) + its `_attention_ops` entry + `sparse_attn_indexer.py` custom branch | The upstreamed aiter `rocm_aiter_sparse_attn_indexer` op handles the V4 pre-inserted-K layout on gfx12 (gluon off); validated at 95% GSM8K. AITER turned on (with the in-code gfx12 sampler guard) so the aiter indexer op is reachable. |
 | `oracle/mxfp4.py` EMULATION + `aiter` (NAVI48-TEST) hunks; `aiter_mxfp4_w4a8_moe.py` activation fix | Both MoE experiments abandoned in favor of `triton_unfused`; reverted to main. |
 | `emulation` / `aiter` options in `serve_deepseek_v4_flash.sh` | MoE backends are now `auto \| triton \| triton_unfused`. |
 

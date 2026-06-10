@@ -116,13 +116,13 @@ _force_env() {
 #                                 decide based on the actual GPU arch.
 case "$MOE_BACKEND" in
     triton|triton_unfused)
-        # AITER not wanted here: MoE uses OAI triton_kernels, and the DSv4
-        # Triton paths (blockscale GEMM, MHC, indexer, sparse-MLA, o-proj) are
-        # direct triton imports enabled by VLLM_DSV4_TRITON — not gated by
-        # rocm_aiter_ops.is_enabled(). Keeping AITER on pulls in the aiter
-        # sampler (top_k_top_p_sampling_from_probs) whose JIT .so fails to build
-        # on gfx12, crashing the profile run. Force both off → native sampler.
-        _force_env VLLM_ROCM_USE_AITER     0
+        # AITER is ON so the ROCm sparse-attention indexer can use the aiter
+        # `rocm_aiter_sparse_attn_indexer` op (gated on rocm_aiter_ops.is_enabled()).
+        # MoE stays on the OAI triton_kernels (AITER_MOE=0). The aiter sampler
+        # (top_k_top_p_sampling_from_probs) is gfx9x-only and would crash on
+        # gfx12, but it's now skipped in-code on gfx12 (see topk_topp_sampler.py
+        # `_ON_GFX12X` guard), so the native sampler is used automatically.
+        _force_env VLLM_ROCM_USE_AITER     1
         _force_env VLLM_ROCM_USE_AITER_MOE 0
         ;;
     auto)
