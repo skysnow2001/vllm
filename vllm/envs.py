@@ -133,7 +133,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
-    VLLM_DSV4_TRITON: bool = False
+
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1189,20 +1189,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
     ),
-    # DeepSeek-V4 "all-Triton" master switch for ROCm archs without CK/ASM
-    # support (e.g. gfx12/Navi48). When True it forces the Triton variants of
-    # aiter ops over the CK/ASM ones that won't run on such archs:
-    #   * enables aiter Triton linear / blockscale GEMM selection (without
-    #     flipping the global aiter is_enabled(), so the Triton sparse indexer
-    #     and MLA paths stay selected);
-    #   * forces the blockscale GEMM onto its Triton kernel (never CK);
-    #   * keeps the Triton sparse indexer even when aiter is otherwise enabled;
-    #   * routes the DSv4 o-proj grouped GEMM through aiter's Triton batched
-    #     GEMM instead of the torch einsum reference.
-    # MoE already lands on the AITER Triton W4A8 path via the mxfp4 oracle.
-    "VLLM_DSV4_TRITON": lambda: (
-        os.getenv("VLLM_DSV4_TRITON", "False").lower() in ("true", "1")
-    ),
+
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE
     # Recommended for large models to get allreduce

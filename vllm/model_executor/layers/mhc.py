@@ -9,18 +9,14 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
-# TileLang's MHC kernels have no ROCm/HIP codegen backend: even when the
-# `tilelang` python package imports cleanly, building any kernel on ROCm raises
-# "Cannot find global function target.build.tilelang_hip". (And on some images
-# the import itself dies on a missing libz3.so transitive dep.) Gate the
-# platform check *first* so on ROCm we (a) never call has_tilelang() — avoiding
-# the libz3 import crash — and (b) take the built-in torch/triton fallbacks
-# (mhc_pre_torch / mhc_post_torch / hc_head_triton) instead of tilelang.
-HAS_TILELANG = (not current_platform.is_rocm()) and has_tilelang()
+# Use TileLang's MHC kernels whenever the `tilelang` package is importable
+# (CUDA and ROCm/HIP alike). When unavailable, fall back to the built-in
+# torch/triton paths or AITER's fused Triton kernels below.
+HAS_TILELANG = has_tilelang()
 
-# On ROCm (e.g. gfx12/Navi48) tilelang has no HIP codegen, so MHC runs through
-# AITER's fused *Triton* kernels (aiter.ops.triton.fusions.mhc) when available.
-# The mhc_*_torch references stay as the backup if the aiter module is missing.
+# On ROCm, when TileLang is not used, MHC runs through AITER's fused *Triton*
+# kernels (aiter.ops.triton.fusions.mhc) when available. The mhc_*_torch
+# references stay as the backup if the aiter module is missing.
 HAS_AITER_TRITON_MHC = (
     current_platform.is_rocm() and mhc_kernels.has_aiter_triton_mhc()
 )

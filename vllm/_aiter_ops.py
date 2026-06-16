@@ -1634,12 +1634,9 @@ class rocm_aiter_ops:
     @classmethod
     @if_aiter_supported
     def is_linear_enabled(cls) -> bool:
-        # VLLM_DSV4_TRITON forces aiter's Triton linear/blockscale GEMM to be
-        # selectable on archs without CK (gfx12) WITHOUT enabling the global
-        # aiter path (is_enabled()), so the Triton sparse indexer stays chosen.
         return (
             cls._AITER_ENABLED and cls._LINEAR_ENABLED
-        ) or envs.VLLM_DSV4_TRITON
+        )
 
     @classmethod
     @if_aiter_supported
@@ -1758,7 +1755,7 @@ class rocm_aiter_ops:
     def is_triton_gemm_enabled(cls) -> bool:
         return (
             cls._AITER_ENABLED and cls._TRITON_UNQUANT_GEMM
-        ) or envs.VLLM_DSV4_TRITON
+        )
 
     @classmethod
     @if_aiter_supported

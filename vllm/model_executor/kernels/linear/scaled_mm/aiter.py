@@ -372,10 +372,7 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         n, k = config.weight_shape
 
         self.use_triton = not current_platform.is_fp8_fnuz() and (
-            # VLLM_DSV4_TRITON forces the Triton kernel unconditionally so an
-            # untuned (n, k) never falls back to the CK kernel (absent on gfx12).
-            envs.VLLM_DSV4_TRITON
-            or rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
+            rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
         )
 
     @classmethod
