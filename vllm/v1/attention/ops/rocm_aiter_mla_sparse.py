@@ -370,17 +370,6 @@ def paged_mqa_logits_module():
     if paged_mqa_logits_module_path is not None:
         try:
             module = importlib.import_module(paged_mqa_logits_module_path)
-            # Force the non-gluon JIT path: the gluon kernels target
-            # gfx950/gfx1250 (CDNA intrinsics) and won't compile on gfx12.
-            # Setting these module globals makes the wrapper's
-            # `if enable_gluon_pa_mqa_logits:` branch False so it dispatches to
-            # the plain @triton.jit `_deepgemm_fp8_paged_mqa_logits*` kernels.
-            for _flag in (
-                "enable_gluon_pa_mqa_logits",
-                "enable_jit_gluon_pa_mqa_logits_kernel",
-            ):
-                if hasattr(module, _flag):
-                    setattr(module, _flag, False)
             return module
         except ImportError:
             return None
